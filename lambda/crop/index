@@ -1,0 +1,115 @@
+const { S3Client, GetObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
+const sharp = require("sharp");
+
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+
+const BUCKET           = process.env.S3_BUCKET;
+const UPLOAD_PREFIX    = process.env.UPLOAD_PREFIX    || "uploads";
+const PROCESSED_PREFIX = process.env.PROCESSED_PREFIX || "processed";
+const OUTPUT_SIZE      = 40; 
+
+// ── Máscara SVG circular ─────────────────────────────────────
+const CIRCLE_MASK_SVG = Buffer.from(
+  `<svg width="${OUTPUT_SIZE}" height="${OUTPUT_SIZE}">
+    <circle cx="${OUTPUT_SIZE / 2}" cy="${OUTPUT_SIZE / 2}" r="${OUTPUT_SIZE / 2}" fill="white"/>
+  </svg>`
+);
+
+// ── Helpers ─────────────────────────────────────────────────
+
+async function downloadFromS3(key) {
+  const command = new GetObjectCommand({ Bucket: BUCKET, Key: key });
+  const response = await s3.send(command);
+
+  // Convertir el stream readable a Buffer
+  const chunks = [];
+  for await (const chunk of response.Body) {
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function cropToCircle(imageBuffer) {
+  const resized = await sharp(imageBuffer)
+    .resize(OUTPUT_SIZE, OUTPUT_SIZE, {
+      fit:      "cover",
+      position: "centre",
+    })
+    .png() 
+    .toBuffer();
+
+  const mask = await sharp(CIRCLE_MASK_SVG)
+    .resize(OUTPUT_SIZE, OUTPUT_SIZE)
+    .png()
+    .toBuffer();
+
+  const circular = await sharp(resized)
+    .composite([{
+      input:   mask,
+      blend:   "dest-in", 
+    }])
+    .png({ compressionLevel: 9, adaptiveFiltering: true })
+    .toBuffer();
+
+  return circular;
+}
+
+
+function parseS3EventFromSQS(sqsRecord) {
+  const body = JSON.parse(sqsRecord.body);
+
+  const s3Event = body.Records?.[0] ?? body;
+  const s3Key   = decodeURIComponent(s3Event.s3.object.key.replace(/\+/g, " "));
+
+  return s3Key;
+}
+
+// ── Handler principal ────────────────────────────────────────
+
+exports.handler = async (event) => {
+  console.log(`Procesando batch de ${event.Records.length} mensajes`);
+  const batchItemFailures = [];
+
+  for (const record of event.Records) {
+    const messageId = record.messageId;
+
+    try {
+      const uploadKey = parseS3EventFromSQS(record);
+      console.log(`Procesando: ${uploadKey}`);
+
+      if (!uploadKey.startsWith(`${UPLOAD_PREFIX}/`)) {
+        console.warn(`Clave inesperada (ignorando): ${uploadKey}`);
+        continue; 
+      }
+
+      const originalBuffer = await downloadFromS3(uploadKey);
+      console.log(`Descargado: ${originalBuffer.length} bytes`);
+
+      const circularBuffer = await cropToCircle(originalBuffer);
+      console.log(`Recortado: ${circularBuffer.length} bytes (circular PNG 40x40)`);
+
+      const filename    = uploadKey.split("/").pop().replace(/\.[^.]+$/, ""); // sin extensión
+      const processedKey = `${PROCESSED_PREFIX}/${filename}_circular.png`;
+
+      await s3.send(new PutObjectCommand({
+        Bucket:      BUCKET,
+        Key:         processedKey,
+        Body:        circularBuffer,
+        ContentType: "image/png",
+        Metadata: {
+          "source-key":  uploadKey,
+          "output-size": `${OUTPUT_SIZE}x${OUTPUT_SIZE}`,
+          "crop-type":   "circular",
+        },
+      }));
+
+      console.log(`Guardado: s3://${BUCKET}/${processedKey}`);
+
+    } catch (err) {
+      console.error(`Error procesando mensaje ${messageId}:`, err);
+      batchItemFailures.push({ itemIdentifier: messageId });
+    }
+  }
+
+  return { batchItemFailures };
+};
