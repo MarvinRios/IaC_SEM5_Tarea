@@ -1,0 +1,178 @@
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+const busboy = require("busboy");
+const { v4: uuidv4 } = require("uuid");
+
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+
+const BUCKET       = process.env.S3_BUCKET;
+const UPLOAD_PREFIX = process.env.UPLOAD_PREFIX || "uploads";
+const MAX_BYTES    = 10 * 1024 * 1024; // 10 MB
+
+// Tipos MIME permitidos según el diagrama
+const ALLOWED_TYPES = {
+  "image/jpeg": "jpg",
+  "image/png":  "png",
+  "image/gif":  "gif",
+  "image/webp": "webp",
+};
+
+// ── Helpers ─────────────────────────────────────────────────
+
+function parseMultipart(event) {
+  return new Promise((resolve, reject) => {
+    const contentType = event.headers["content-type"] || event.headers["Content-Type"];
+    const bb = busboy({ headers: { "content-type": contentType } });
+
+    let fileBuffer = null;
+    let mimeType   = null;
+    let filename   = "upload";
+    let totalBytes = 0;
+
+    bb.on("file", (fieldname, fileStream, info) => {
+      mimeType = info.mimeType;
+      filename = info.filename || "upload";
+      const chunks = [];
+
+      fileStream.on("data", (chunk) => {
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_BYTES) {
+          fileStream.destroy();
+          reject(new Error("FILE_TOO_LARGE"));
+          return;
+        }
+        chunks.push(chunk);
+      });
+
+      fileStream.on("end", () => {
+        fileBuffer = Buffer.concat(chunks);
+      });
+    });
+
+    bb.on("finish", () => {
+      if (!fileBuffer) return reject(new Error("NO_FILE_FIELD"));
+      resolve({ buffer: fileBuffer, mimeType, originalName: filename });
+    });
+
+    bb.on("error", reject);
+
+    // El body puede venir en base64 si API Gateway lo codificó
+    const rawBody = event.isBase64Encoded
+      ? Buffer.from(event.body, "base64")
+      : Buffer.from(event.body || "");
+
+    bb.write(rawBody);
+    bb.end();
+  });
+}
+
+function parseJsonBase64(body) {
+  const parsed = JSON.parse(body);
+  if (!parsed.image) throw new Error("NO_IMAGE_FIELD");
+
+  const mimeType = parsed.mimeType || "image/jpeg";
+  const buffer   = Buffer.from(parsed.image, "base64");
+
+  if (buffer.length > MAX_BYTES) throw new Error("FILE_TOO_LARGE");
+
+  return { buffer, mimeType, originalName: parsed.filename || "upload" };
+}
+
+/**
+ * Respuesta HTTP estándar
+ */
+function response(statusCode, body) {
+  return {
+    statusCode,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  };
+}
+
+// ── Handler principal ────────────────────────────────────────
+
+exports.handler = async (event) => {
+  console.log("Event received:", JSON.stringify({
+    method: event.requestContext?.http?.method,
+    path:   event.rawPath,
+    env:    process.env.ENVIRONMENT,
+  }));
+
+  try {
+    // 1. Determinar formato del body
+    const contentType = (event.headers["content-type"] || event.headers["Content-Type"] || "").toLowerCase();
+    let imageData;
+
+    if (contentType.includes("multipart/form-data")) {
+      imageData = await parseMultipart(event);
+    } else if (contentType.includes("application/json")) {
+      imageData = parseJsonBase64(event.body);
+    } else {
+      return response(415, {
+        error: "Unsupported Media Type",
+        message: "Use multipart/form-data o application/json con base64",
+      });
+    }
+
+    const { buffer, mimeType } = imageData;
+
+    // 2. Validar tipo de archivo
+    const extension = ALLOWED_TYPES[mimeType];
+    if (!extension) {
+      return response(400, {
+        error: "Invalid file type",
+        message: `Tipo no permitido: ${mimeType}. Permitidos: jpg, png, gif, webp`,
+        allowed: Object.keys(ALLOWED_TYPES),
+      });
+    }
+
+    // 3. Validar tamaño (doble verificación)
+    if (buffer.length > MAX_BYTES) {
+      return response(413, {
+        error: "File too large",
+        message: `El archivo excede el límite de 10 MB (recibido: ${(buffer.length / 1024 / 1024).toFixed(2)} MB)`,
+      });
+    }
+
+    // 4. Generar clave única en S3
+    const fileId  = uuidv4();
+    const s3Key   = `${UPLOAD_PREFIX}/${fileId}.${extension}`;
+
+    // 5. Subir a S3
+    await s3.send(new PutObjectCommand({
+      Bucket:      BUCKET,
+      Key:         s3Key,
+      Body:        buffer,
+      ContentType: mimeType,
+      Metadata: {
+        "original-name": Buffer.from(imageData.originalName).toString("ascii").replace(/[^\x20-\x7E]/g, "_"),
+        "upload-env":    process.env.ENVIRONMENT || "unknown",
+      },
+    }));
+
+    console.log(`Uploaded: s3://${BUCKET}/${s3Key} (${buffer.length} bytes)`);
+
+    return response(200, {
+      message:  "Imagen subida exitosamente",
+      fileId,
+      s3Key,
+      size:     buffer.length,
+      mimeType,
+    });
+
+  } catch (err) {
+    console.error("Error en upload-lambda:", err);
+
+    if (err.message === "FILE_TOO_LARGE") {
+      return response(413, { error: "File too large", message: "El archivo supera 10 MB" });
+    }
+    if (err.message === "NO_FILE_FIELD" || err.message === "NO_IMAGE_FIELD") {
+      return response(400, { error: "Missing file", message: "No se encontró archivo en la solicitud" });
+    }
+
+    return response(500, {
+      error:   "Internal Server Error",
+      message: "Error al procesar la imagen",
+      requestId: process.env.AWS_REQUEST_ID,
+    });
+  }
+};
